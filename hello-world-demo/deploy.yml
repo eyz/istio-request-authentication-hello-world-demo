@@ -1,0 +1,163 @@
+# App namespace, ServiceAccount, the two containers, and the two Services.
+# The gateway, mTLS policy, and JWT policies are in ../istio-depoy.yaml.
+# What each object is for: ../README.md#what-is-deployed
+#
+# istio-injection adds istio-proxy to pods in this namespace.
+# https://istio.io/v1.32/docs/setup/additional-setup/sidecar-injection/
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hello-world-demo
+  labels:
+    istio-injection: enabled
+---
+# Dedicated workload identity for the app pod:
+# spiffe://cluster.local/ns/hello-world-demo/sa/hello-world.
+# automountServiceAccountToken is false so hello and auth receive no
+# Kubernetes API token; Istio injects its own projected istio-token volume
+# into istio-proxy for mesh mTLS.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hello-world
+  namespace: hello-world-demo
+automountServiceAccountToken: false
+---
+# One pod, two containers. They share a network namespace, so they cannot both
+# bind 8080. https://kubernetes.io/docs/concepts/workloads/pods/#pod-networking
+# hello/ is the API. auth/ is the signer. Images come from scripts/build-push.sh.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-world
+  namespace: hello-world-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hello-world
+  template:
+    metadata:
+      # The RequestAuthentication and AuthorizationPolicy objects in
+      # ../istio-depoy.yaml select this label, and only inside this namespace.
+      labels:
+        app: hello-world
+      annotations:
+        # Kubelet probes are redirected to the sidecar agent on port 15020, so
+        # they reach both containers without a mesh certificate and without a JWT.
+        # https://istio.io/v1.32/docs/reference/config/annotations/
+        sidecar.istio.io/rewriteAppHTTPProbers: "true"
+    spec:
+      serviceAccountName: hello-world
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # GET /api/v1/hello returns "hello world". GET /healthz returns "ok".
+        # The proxy in front of 8080 enforces default-deny and the JWT rule.
+        # See ../README.md#which-requests-must-carry-a-token.
+        - name: hello
+          image: sol:5000/hello-world:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Kubelet probes are rewritten to :15020/app-health/hello/{livez,readyz},
+          # and GET /healthz is also the AuthorizationPolicy health rule.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+        # Signer and JWKS publisher. Sees /token and the JWKS path, and stays
+        # off /api/v1/hello.
+        # Private key: hello-world-demo/auth/key.go and ../README.md#how-the-key-works
+        - name: auth
+          image: sol:5000/hello-auth:latest
+          imagePullPolicy: Always
+          ports:
+            - name: auth
+              containerPort: 8081
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: auth
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: auth
+            periodSeconds: 10
+---
+# Cluster address the VirtualService in ../istio-depoy.yaml routes to.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-world
+  namespace: hello-world-demo
+spec:
+  selector:
+    app: hello-world
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# DNS name for the signer on the same pods. Mesh callers, including the
+# gateway and the pod proxy, use this Service over mTLS. The VirtualService
+# in ../istio-depoy.yaml publishes /token and the JWKS path on the gateway
+# for web clients.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-auth
+  namespace: hello-world-demo
+spec:
+  selector:
+    app: hello-world
+  # The name must start with http so the sidecar treats this port as HTTP.
+  # A name Istio does not recognize becomes raw TCP, and the proxy cannot
+  # fetch JWKS over it.
+  # https://istio.io/v1.32/docs/ops/configuration/traffic-management/protocol-selection/
+  ports:
+    - name: http-auth
+      port: 8081
+      targetPort: auth

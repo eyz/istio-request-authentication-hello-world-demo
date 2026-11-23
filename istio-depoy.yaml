@@ -1,0 +1,303 @@
+# Edge of the demo, mesh-wide strict mTLS, and the app-namespace JWT policies.
+# Gateway resources live in hello-world-istio. PeerAuthentication lives in
+# istio-system so every meshed pod in every namespace requires mTLS. The
+# DestinationRules, RequestAuthentication, and AuthorizationPolicies live in
+# hello-world-demo because workload selectors only match their own namespace.
+# Map of every object: README.md#what-is-deployed
+#
+# Dedicated gateway namespace, separate from istio-system and from the app.
+# Istio recommends the gateway not share the control-plane namespace:
+# https://istio.io/v1.32/docs/setup/additional-setup/gateway/
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hello-world-istio
+---
+# Dedicated workload identity for the ingress gateway:
+# spiffe://cluster.local/ns/hello-world-istio/sa/hello-ingressgateway.
+# Because this Gateway is HTTP only and terminates no TLS, this repo grants it
+# no Secret-reading RBAC. A deployment that terminates TLS at the edge adds an
+# SDS Role bound to this ServiceAccount, never to default.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hello-ingressgateway
+  namespace: hello-world-istio
+automountServiceAccountToken: false
+---
+# Publishes the dedicated gateway on the node address, port 9090.
+# The default istio-ingressgateway Service in istio-system stays unused:
+# its LoadBalancer wants host 80/443, which Traefik already holds.
+# externalIPs is how 192.168.1.3:9090 is reached. See README.md#what-is-deployed.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello-ingressgateway
+  namespace: hello-world-istio
+spec:
+  type: ClusterIP
+  externalIPs:
+    - 192.168.1.3
+  # Must equal the pod label and the Gateway selector below.
+  selector:
+    istio: hello-ingressgateway
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+---
+# Gateway proxy pod, using the Kubernetes YAML method from
+# https://istio.io/v1.32/docs/setup/additional-setup/gateway/
+# The label is unique so this pod is not the shared istio=ingressgateway.
+# A shared gateway would reuse that stock label and attach routes to it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-ingressgateway
+  namespace: hello-world-istio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      istio: hello-ingressgateway
+  template:
+    metadata:
+      annotations:
+        # Gateway injection template, not the default sidecar template.
+        inject.istio.io/templates: gateway
+      labels:
+        istio: hello-ingressgateway
+        # Opt this pod in. The namespace itself is not labeled for injection.
+        sidecar.istio.io/inject: "true"
+    spec:
+      serviceAccountName: hello-ingressgateway
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: istio-proxy
+          # Placeholder. The injector replaces it with proxyv2 on admit.
+          image: auto
+          ports:
+            - name: http
+              containerPort: 9090
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          # Drop all capabilities, run non-root as uid/gid 1337, read-only root.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1337
+            runAsGroup: 1337
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: 15021
+            initialDelaySeconds: 1
+            periodSeconds: 2
+---
+# Binds the proxy pod to HTTP port 9090 for every host.
+# The selector is searched across namespaces by default, so this Gateway can
+# select the pod in this namespace. See
+# https://istio.io/v1.32/docs/reference/config/networking/gateway/
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: hello-world
+  namespace: hello-world-istio
+spec:
+  selector:
+    istio: hello-ingressgateway
+  servers:
+    - port:
+        number: 9090
+        name: http
+        protocol: HTTP
+      hosts:
+        - "*"
+---
+# Every web client enters through this Gateway.
+# https://istio.io/v1.32/docs/reference/config/networking/virtual-service/
+# Two routes. The first match wins.
+#   /token and the JWKS path go to hello-auth on 8081.
+#   Every other path goes to hello-world on 8080.
+# Both hops are mTLS: DestinationRule mode ISTIO_MUTUAL, and mesh-wide
+# PeerAuthentication STRICT rejects plaintext. Web clients have no other
+# address. A meshed pod may call either Service directly over mTLS.
+# See README.md#which-requests-must-carry-a-token.
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: hello-world
+  namespace: hello-world-istio
+spec:
+  hosts:
+    - "*"
+  gateways:
+    - hello-world
+  http:
+    - match:
+        - uri:
+            exact: /token
+        - uri:
+            exact: /.well-known/jwks.json
+      route:
+        - destination:
+            host: hello-auth.hello-world-demo.svc.cluster.local
+            port:
+              number: 8081
+    - route:
+        - destination:
+            host: hello-world.hello-world-demo.svc.cluster.local
+            port:
+              number: 8080
+---
+# Mesh-wide strict mTLS. Placing a selectorless PeerAuthentication in the mesh
+# root namespace (istio-system) requires mTLS for inbound connections to every
+# sidecar-injected pod across every namespace. Plaintext from a web client or
+# from a non-meshed pod is rejected. Gateway inbound TLS is configured on the
+# Gateway resource instead, so port 9090 stays open for web clients.
+# https://istio.io/v1.32/docs/reference/config/security/peer_authentication/
+# https://istio.io/v1.32/docs/ops/best-practices/security/
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  mtls:
+    mode: STRICT
+---
+# Originate Istio mTLS from the gateway (and from any other proxy) to the API.
+# ISTIO_MUTUAL uses the certificates Istio already issued. Leaving this unset
+# would let auto mTLS do the same thing; setting it makes the mode visible
+# and keeps a later plaintext rule from taking the hop.
+# https://istio.io/v1.32/docs/reference/config/networking/destination-rule/
+# https://istio.io/v1.32/docs/ops/configuration/traffic-management/tls-configuration/
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: hello-world
+  namespace: hello-world-demo
+spec:
+  host: hello-world.hello-world-demo.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+---
+# Same mode for the signer. The gateway's /token and JWKS routes and the pod
+# proxy's JWKS fetch use this host over mTLS.
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: hello-auth
+  namespace: hello-world-demo
+spec:
+  host: hello-auth.hello-world-demo.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+---
+# Declares which JWTs the hello pod proxy will validate.
+# Namespace is hello-world-demo on purpose: "The selector will match with
+# workloads in the same namespace as the request authentication policy."
+# A cross-namespace targetRef is rejected by this cluster's CRD.
+# https://istio.io/v1.32/docs/reference/config/security/request_authentication/
+# Key lifecycle: README.md#how-the-key-works and hello-world-demo/auth/README.md
+apiVersion: security.istio.io/v1
+kind: RequestAuthentication
+metadata:
+  name: hello-world
+  namespace: hello-world-demo
+spec:
+  selector:
+    matchLabels:
+      app: hello-world
+  jwtRules:
+    # issuer must equal the token iss claim. A different iss is rejected.
+    - issuer: hello-auth
+      # In-mesh URL. scripts/install.sh sets PILOT_JWT_ENABLE_REMOTE_JWKS=true
+      # before applying this file, so the pod proxy fetches the document over
+      # mTLS. istiod's own client is not a sidecar and cannot satisfy STRICT.
+      # https://istio.io/v1.32/docs/reference/commands/pilot-discovery/
+      jwksUri: http://hello-auth.hello-world-demo.svc.cluster.local:8081/.well-known/jwks.json
+      # Default is false, which would strip Authorization before hello logs iss/sub.
+      forwardOriginalToken: true
+---
+# Explicit default-deny policy for the hello-world workload. In Istio, an
+# ALLOW policy with no rules matches nothing, so even if the allow rules below
+# are removed, every request to this pod stays denied.
+# https://istio.io/v1.32/docs/reference/config/security/authorization-policy/
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: hello-world-deny-all
+  namespace: hello-world-demo
+spec:
+  selector:
+    matchLabels:
+      app: hello-world
+---
+# Narrow ALLOW rules layered on top of default-deny.
+# Port 8080 is the hello app. It allows a validated JWT, or GET /healthz so
+# Kubernetes probes and the gateway health check succeed. Every other request
+# to that port is denied. The reference health exception is:
+# https://istio.io/v1.32/docs/reference/config/security/request_authentication/
+# Port 8081 is the signer. Minting and the JWKS fetch cannot present a JWT.
+# Those paths stay open on GET and on 8081 only, and mesh-wide
+# PeerAuthentication STRICT still requires mTLS to reach them.
+# See README.md#which-requests-must-carry-a-token.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: hello-world
+  namespace: hello-world-demo
+spec:
+  selector:
+    matchLabels:
+      app: hello-world
+  action: ALLOW
+  # Rules are OR'd. A request is allowed when any rule matches.
+  rules:
+    # Valid JWT, hello port only. "*" matches a non-empty principal,
+    # "<issuer>/<subject>" after jwtRules accepts the token.
+    - from:
+        - source:
+            requestPrincipals: ["*"]
+      to:
+        - operation:
+            ports: ["8080"]
+    # Kubernetes liveness and readiness are GET /healthz. Other methods on
+    # that path are denied. rewriteAppHTTPProbers also sends kubelet to
+    # port 15020, which does not pass through this filter.
+    - to:
+        - operation:
+            methods: ["GET"]
+            paths: ["/healthz"]
+            ports: ["8080"]
+    - to:
+        - operation:
+            methods: ["GET"]
+            paths: ["/healthz"]
+            ports: ["8081"]
+    # Signer GET endpoints only. POST /token is denied at Envoy (403) before
+    # reaching auth, and auth also rejects non-GET with 405 in process.
+    # A web client reaches these through the gateway, which routes them to
+    # 8081. A meshed pod may call Service/hello-auth directly over mTLS.
+    - to:
+        - operation:
+            methods: ["GET"]
+            paths: ["/token", "/.well-known/jwks.json"]
+            ports: ["8081"]
